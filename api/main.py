@@ -7,12 +7,16 @@ from datetime import datetime, timedelta
 import sys
 import os
 import subprocess
-
+# 启动api接口命令：python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 # 添加数据库路径
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'database'))
 
 from database.models import get_session, StockData, ResearchReport, FinancialNews
 from pydantic import BaseModel
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'database'))
+from database.crawler_config import CrawlerConfig, DEFAULT_CONFIG_TEMPLATE
+
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -29,7 +33,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # Pydantic模型用于API响应
 class StockDataResponse(BaseModel):
@@ -82,6 +85,29 @@ class SystemStatsResponse(BaseModel):
     total_reports: int
     total_news: int
     last_update: Optional[datetime]
+
+#添加可配置规则的response模型
+class CrawlerConfigResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    website_name: str
+    config_json: str
+    is_active: bool
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+    last_run_at: Optional[datetime]
+    run_count: int
+    success_count: int
+
+    class Config:
+        from_attributes = True
+
+class ConfigCreateRequest(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    website_name: str
+    config_json: str
 
 
 # 依赖项：获取数据库会话
@@ -351,6 +377,141 @@ async def get_top_stocks(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取排行榜失败: {str(e)}")
+
+
+# 获取所有配置的api接口
+@app.get("/api/configs", response_model=List[CrawlerConfigResponse], tags=["爬虫配置"])
+async def get_crawler_configs(
+        skip: int = Query(0, ge=0),
+        limit: int = Query(50, ge=1, le=100),
+        db: Session = Depends(get_db)
+):
+    """获取爬虫配置列表"""
+    try:
+        configs = db.query(CrawlerConfig).offset(skip).limit(limit).all()
+        return configs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取配置失败: {str(e)}")
+
+
+# 创建新配置
+@app.post("/api/configs", response_model=CrawlerConfigResponse, tags=["爬虫配置"])
+async def create_crawler_config(
+        config_request: ConfigCreateRequest,
+        db: Session = Depends(get_db)
+):
+    """创建新的爬虫配置"""
+    try:
+        # 检查名称是否已存在
+        existing = db.query(CrawlerConfig).filter(CrawlerConfig.name == config_request.name).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="配置名称已存在")
+
+        # 创建新配置
+        new_config = CrawlerConfig(
+            name=config_request.name,
+            description=config_request.description,
+            website_name=config_request.website_name,
+            config_json=config_request.config_json
+        )
+
+        # 验证配置
+        is_valid, error_msg = new_config.validate_config()
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=f"配置无效: {error_msg}")
+
+        db.add(new_config)
+        db.commit()
+        db.refresh(new_config)
+
+        return new_config
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"创建配置失败: {str(e)}")
+
+
+# 运行指定配置的爬虫
+@app.post("/api/configs/{config_id}/run", tags=["爬虫配置"])
+async def run_crawler_config(
+        config_id: int,
+        background_tasks: BackgroundTasks,
+        db: Session = Depends(get_db)
+):
+    """运行指定配置的爬虫"""
+    try:
+        # 获取配置
+        config = db.query(CrawlerConfig).filter(CrawlerConfig.id == config_id).first()
+        if not config:
+            raise HTTPException(status_code=404, detail="配置不存在")
+
+        if not config.is_active:
+            raise HTTPException(status_code=400, detail="配置已禁用")
+
+        # 验证配置
+        is_valid, error_msg = config.validate_config()
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=f"配置无效: {error_msg}")
+
+        # 在后台运行爬虫
+        background_tasks.add_task(run_dynamic_spider, config.name, config_id, db)
+
+        return {
+            "message": f"爬虫配置 '{config.name}' 已启动",
+            "config_id": config_id,
+            "config_name": config.name,
+            "status": "started"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"启动爬虫失败: {str(e)}")
+
+
+def run_dynamic_spider(config_name: str, config_id: int, db: Session):
+    """运行动态爬虫的后台任务"""
+    import subprocess
+    import os
+    from datetime import datetime
+
+    try:
+        # 更新运行统计
+        config = db.query(CrawlerConfig).filter(CrawlerConfig.id == config_id).first()
+        if config:
+            config.run_count += 1
+            config.last_run_at = datetime.utcnow()
+            db.commit()
+
+        # 切换到项目根目录
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        # 运行动态爬虫
+        result = subprocess.run([
+            'scrapy', 'crawl', 'dynamic',
+            '-a', f'config_name={config_name}',
+            '-s', 'CLOSESPIDER_ITEMCOUNT=50'  # 限制数量避免过度爬取
+        ], cwd=project_root, capture_output=True, text=True)
+
+        # 更新成功统计
+        if result.returncode == 0:
+            config = db.query(CrawlerConfig).filter(CrawlerConfig.id == config_id).first()
+            if config:
+                config.success_count += 1
+                db.commit()
+
+        print(f"动态爬虫执行完成，配置: {config_name}, 返回码: {result.returncode}")
+        if result.stdout:
+            print(f"输出: {result.stdout}")
+        if result.stderr:
+            print(f"错误: {result.stderr}")
+
+    except Exception as e:
+        print(f"运行动态爬虫失败: {e}")
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

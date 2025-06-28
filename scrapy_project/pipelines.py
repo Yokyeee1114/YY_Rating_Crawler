@@ -23,7 +23,6 @@ except ImportError:
     DATABASE_AVAILABLE = False
     print("Warning: 数据库模块未找到，将只使用文件存储")
 
-
 class FinancialDataPipeline:
     def __init__(self):
         self.file = None
@@ -53,11 +52,11 @@ class FinancialDataPipeline:
         # 添加爬取时间
         item['crawl_time'] = datetime.now().isoformat()
 
-        # 文件存储（保持原有功能）
+        # 文件存储
         line = json.dumps(dict(item), ensure_ascii=False) + "\n"
         self.file.write(line)
 
-        # 数据库存储（新增功能）
+        # 数据库存储
         if self.session:
             try:
                 self._save_to_database(item, spider)
@@ -109,6 +108,13 @@ class FinancialDataPipeline:
             )
         else:
             spider.logger.warning("未知的item类型，跳过数据库存储")
+
+            spider.logger.info(f"=== 调试信息 ===")
+            spider.logger.info(f"Item字段: {list(item.fields.keys())}")
+            spider.logger.info(f"Item类型: {type(item)}")
+            spider.logger.info(f"Item_dict: {item_dict}")
+            spider.logger.info(f"Item_dict.keys(): {list(item_dict.keys())}")
+
             return
 
         self.session.add(db_item)
